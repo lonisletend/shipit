@@ -2,7 +2,10 @@
 """shipit: deploy frontend dist bundles from GitHub release assets."""
 
 import argparse
+import codecs
+import configparser
 import fcntl
+import io
 import json
 import os
 import pwd
@@ -17,10 +20,14 @@ import time
 import urllib.request
 from pathlib import Path
 
-if sys.version_info < (3, 11):
-    sys.exit("shipit 需要 Python 3.11+")
+if sys.version_info < (3, 6):
+    sys.exit("shipit 需要 Python 3.6+")
 
-import tomllib
+# Python 3.6 under cron's C locale uses ASCII for stdio, which breaks on non-ASCII log output.
+for _name in ("stdout", "stderr"):
+    _stream = getattr(sys, _name)
+    if codecs.lookup(_stream.encoding or "ascii").name == "ascii":
+        setattr(sys, _name, io.TextIOWrapper(_stream.buffer, encoding="utf-8", line_buffering=True))
 
 DEFAULTS = {
     "cron": "*/10 * * * *",
@@ -33,6 +40,7 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 CRON_BEGIN = "# >>> shipit >>>"
 CRON_END = "# <<< shipit <<<"
 PRESERVED_PREFIX = "pre-shipit-"
+CONFIG_SECTION = "project"
 HTTP_TIMEOUT = 60
 
 
@@ -44,7 +52,8 @@ def log(msg, name=None):
 
 
 def default_home():
-    if env := os.environ.get("SHIPIT_HOME"):
+    env = os.environ.get("SHIPIT_HOME")
+    if env:
         return Path(env)
     if os.geteuid() == 0:
         return Path("/etc/shipit")
@@ -66,17 +75,28 @@ class Home:
     def project_names(self):
         if not self.projects.is_dir():
             return []
-        return sorted(p.stem for p in self.projects.glob("*.toml"))
+        return sorted(p.stem for p in self.projects.glob("*.ini"))
 
     def load_project(self, name):
-        path = self.projects / f"{name}.toml"
+        path = self.projects / f"{name}.ini"
         if not path.is_file():
             raise SystemExit(f"项目不存在: {name}（{path}）")
-        with path.open("rb") as f:
-            cfg = {**DEFAULTS, **tomllib.load(f)}
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            parser.read(str(path), encoding="utf-8")
+        except configparser.Error as e:
+            raise SystemExit(f"{path}: 配置格式错误: {e}")
+        if not parser.has_section(CONFIG_SECTION):
+            raise SystemExit(f"{path}: 缺少 [{CONFIG_SECTION}] 段")
+        cfg = dict(DEFAULTS)
+        cfg.update(parser[CONFIG_SECTION])
         for key in ("owner", "repo", "deploy_path"):
             if not cfg.get(key):
                 raise SystemExit(f"{path}: 缺少必填项 {key}")
+        try:
+            cfg["keep"] = int(cfg["keep"])
+        except ValueError:
+            raise SystemExit(f"{path}: keep 必须是整数")
         cfg["name"] = name
         cfg["deploy_path"] = Path(cfg["deploy_path"]).expanduser()
         return cfg
@@ -84,26 +104,21 @@ class Home:
     def load_state(self, name):
         path = self.state / f"{name}.json"
         if path.is_file():
-            return json.loads(path.read_text())
+            return json.loads(path.read_text(encoding="utf-8"))
         return {}
 
     def save_state(self, name, state):
         path = self.state / f"{name}.json"
         tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n")
+        tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         os.replace(tmp, path)
 
 
-def toml_dump(data):
-    lines = []
-    for key, value in data.items():
-        if isinstance(value, bool):
-            lines.append(f"{key} = {'true' if value else 'false'}")
-        elif isinstance(value, int):
-            lines.append(f"{key} = {value}")
-        else:
-            lines.append(f"{key} = {json.dumps(str(value), ensure_ascii=False)}")
-    return "\n".join(lines) + "\n"
+def write_config(path, data):
+    parser = configparser.ConfigParser(interpolation=None)
+    parser[CONFIG_SECTION] = {k: str(v) for k, v in data.items()}
+    with open(str(path), "w", encoding="utf-8") as f:
+        parser.write(f)
 
 
 def version_key(v):
@@ -148,6 +163,8 @@ def safe_extract(archive, dest):
                 raise RuntimeError(f"压缩包包含不允许的条目类型: {m.name}")
             if os.path.commonpath([dest_real, target]) != dest_real:
                 raise RuntimeError(f"压缩包包含越界路径: {m.name}")
+            m.mode = 0o755 if m.isdir() or m.mode & 0o100 else 0o644
+            m.uid, m.gid, m.uname, m.gname = os.getuid(), os.getgid(), "", ""
         tar.extractall(dest)
 
 
@@ -270,7 +287,7 @@ def check_deploy_path(deploy_path):
     if not os.access(existing, os.W_OK | os.X_OK):
         target = "目录" if existing == parent else "上级目录"
         msg = f"当前用户 {user} 对{target} {existing} 没有写权限（shipit 需要在 {parent} 下创建版本目录和软链）。\n"
-        if parent.is_relative_to("/usr") or parent.is_relative_to("/etc"):
+        if any(d in (parent, *parent.parents) for d in (Path("/usr"), Path("/etc"))):
             msg += f"  {parent} 是系统目录，不建议 chown，请改用专属目录，例如 /srv/www/<项目>/html，并修改 nginx root"
         else:
             q = shlex.quote(str(parent))
@@ -427,8 +444,8 @@ def cmd_init(home, args):
         "asset": asset,
         "keep": keep,
     }
-    path = home.projects / f"{name}.toml"
-    path.write_text(toml_dump(cfg))
+    path = home.projects / f"{name}.ini"
+    write_config(path, cfg)
     print(f"已写入 {path}")
 
     try:
@@ -522,7 +539,7 @@ def cron_lines(home):
 
 
 def read_crontab():
-    res = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    res = subprocess.run(["crontab", "-l"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8")
     return res.stdout if res.returncode == 0 else ""
 
 
@@ -541,7 +558,7 @@ def cron_sync(home):
         kept.pop()
     block = cron_lines(home) if home.project_names() else []
     new = "\n".join(kept + ([""] if kept and block else []) + block) + "\n"
-    subprocess.run(["crontab", "-"], input=new, text=True, check=True)
+    subprocess.run(["crontab", "-"], input=new, encoding="utf-8", check=True)
     print(f"已同步 {len(block) - 2 if block else 0} 个 cron 任务到当前用户 crontab")
 
 
@@ -554,12 +571,15 @@ def cmd_cron(home, args):
 
 
 def cmd_remove(home, args):
-    path = home.projects / f"{args.name}.toml"
+    path = home.projects / f"{args.name}.ini"
     if not path.is_file():
         print(f"项目不存在: {args.name}", file=sys.stderr)
         return 1
     path.unlink()
-    (home.state / f"{args.name}.json").unlink(missing_ok=True)
+    try:
+        (home.state / f"{args.name}.json").unlink()
+    except FileNotFoundError:
+        pass
     print(f"已删除项目配置 {path}（部署目录和历史版本未改动）")
     cron_sync(home)
     return 0
@@ -568,7 +588,8 @@ def cmd_remove(home, args):
 def main(argv=None):
     p = argparse.ArgumentParser(prog="shipit", description="基于 GitHub release asset 的前端自动部署")
     p.add_argument("--home", default=None, help="配置目录（默认 $SHIPIT_HOME，root 为 /etc/shipit，否则 ~/.config/shipit）")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd")
+    sub.required = True
 
     s = sub.add_parser("init", help="交互式创建项目配置")
     s.add_argument("name", nargs="?")

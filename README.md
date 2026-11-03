@@ -1,6 +1,6 @@
 # Shipit
 
-基于 GitHub Release asset 的轻量前端自动部署工具。单文件、仅依赖 Python 3.11+ 标准库。
+基于 GitHub Release asset 的轻量前端自动部署工具。单文件、仅依赖 Python 3.6+ 标准库（兼容 CentOS 7 自带的 Python 3.6.8）。
 
 ## 工作流程
 
@@ -37,7 +37,7 @@ shipit remove lonekit    # 删除项目配置并同步 cron
 配置根目录：`--home` > `$SHIPIT_HOME` > `/etc/shipit`（root）> `~/.config/shipit`
 
 ```
-projects/<name>.toml   项目配置
+projects/<name>.ini    项目配置
 state/<name>.json      已部署版本（程序维护）
 logs/<name>.log        cron 运行日志
 locks/<name>.lock      防止并发执行
@@ -45,13 +45,14 @@ locks/<name>.lock      防止并发执行
 
 配置示例：
 
-```toml
-owner = "lonisletend"
-repo = "LoneKit"
-deploy_path = "/srv/www/lonekit/html"
-cron = "*/10 * * * *"
-tag = "app-v{version}"
-asset = "dist-v{version}.tar.gz"
+```ini
+[project]
+owner = lonisletend
+repo = LoneKit
+deploy_path = /srv/www/lonekit/html
+cron = */10 * * * *
+tag = app-v{version}
+asset = dist-v{version}.tar.gz
 keep = 5
 ```
 
@@ -72,7 +73,7 @@ shipit 需要对部署目录的**父目录**有写权限，nginx 只需读权限
 
 ```sh
 sudo mkdir -p /srv/www/lonekit && sudo chown $USER: /srv/www/lonekit
-# deploy_path = "/srv/www/lonekit/html"，nginx root 指向同一路径
+# deploy_path = /srv/www/lonekit/html，nginx root 指向同一路径
 ```
 
 `init` 和 `run` 会检查写权限（不满足时 `run` 在下载前即退出），并对以下情况给出修复命令：
